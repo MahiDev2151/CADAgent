@@ -2049,6 +2049,7 @@ function rebuildDocStateFromDom(docId) {
             const textEl = node.querySelector('.message-text');
             const headerSender = node.querySelector('.message-sender');
             const messageId = node.getAttribute('data-message-id');
+            const requestId = node.getAttribute('data-request-id');
             items.push({
                 type: 'message',
                 role: roleClass,
@@ -2057,7 +2058,8 @@ function rebuildDocStateFromDom(docId) {
                     sender: headerSender ? headerSender.textContent : undefined,
                     variant: Array.from(node.classList).find((c) => ['info', 'error', 'warning', 'success', 'agent'].includes(c)) || undefined,
                     contentFormat: 'html',
-                    messageId: messageId || null
+                    messageId: messageId || null,
+                    requestId: requestId || null
                 }
             });
         } else if (node.classList.contains('run-feed')) {
@@ -2089,6 +2091,25 @@ function rebuildDocStateFromDom(docId) {
     docState.activeRunId = null;
     docState.lastUpdated = Date.now();
     persistDocState(docId);
+}
+
+function clearStoredCheckpointAssociations(docId) {
+    const docState = getDocState(docId, false);
+    if (!docState || !Array.isArray(docState.items)) return false;
+    let changed = false;
+    docState.items.forEach((item) => {
+        if (!item || item.type !== 'message' || !item.options) return;
+        if (item.options.messageId || item.options.requestId) {
+            item.options.messageId = null;
+            item.options.requestId = null;
+            changed = true;
+        }
+    });
+    if (changed) {
+        docState.lastUpdated = Date.now();
+        persistDocState(docId);
+    }
+    return changed;
 }
 
 function hasActiveRun() {
@@ -2953,10 +2974,11 @@ function updateConnectionStatus(connected, sessionId = null, docId = null) {
             console.log('Clearing pending checkpoint queue due to session change/disconnect');
             state.pendingCheckpointQueue = [];
         }
+        clearStoredCheckpointAssociations(targetDocId);
 
         // Remove stale data-message-id and data-request-id attributes from DOM
         if (elements.chatMessages) {
-            const messagesWithCheckpoints = elements.chatMessages.querySelectorAll('[data-message-id]');
+            const messagesWithCheckpoints = elements.chatMessages.querySelectorAll('[data-message-id], [data-request-id]');
             if (messagesWithCheckpoints.length > 0) {
                 console.log('Removing', messagesWithCheckpoints.length, 'stale checkpoint associations');
                 messagesWithCheckpoints.forEach(el => {
@@ -3124,7 +3146,8 @@ function appendMessage(role, text, options = {}) {
                 sender: options.sender,
                 variant: options.variant,
                 contentFormat: format,
-                messageId: options.messageId || null
+                messageId: options.messageId || null,
+                requestId: options.requestId || null
             }
         });
         docState.lastUpdated = Date.now();
@@ -4450,6 +4473,46 @@ function findLastUnassociatedUserMessage() {
     return null;
 }
 
+function syncMessageIdentityInDocState(messageEl, options = {}) {
+    const { persist = true } = options;
+    if (!messageEl || !elements.chatMessages || !currentDocId) {
+        return false;
+    }
+
+    const docState = getDocState(currentDocId, false);
+    if (!docState || !Array.isArray(docState.items)) {
+        return false;
+    }
+
+    const messageNodes = Array.from(elements.chatMessages.querySelectorAll('.message'));
+    const visibleMessageIndex = messageNodes.indexOf(messageEl);
+    if (visibleMessageIndex < 0) {
+        return false;
+    }
+
+    let seenMessages = -1;
+    const item = docState.items.find((candidate) => {
+        if (!candidate || candidate.type !== 'message') {
+            return false;
+        }
+        seenMessages += 1;
+        return seenMessages === visibleMessageIndex;
+    });
+
+    if (!item) {
+        return false;
+    }
+
+    item.options = item.options || {};
+    item.options.messageId = messageEl.getAttribute('data-message-id') || null;
+    item.options.requestId = messageEl.getAttribute('data-request-id') || null;
+    docState.lastUpdated = Date.now();
+    if (persist) {
+        persistDocState(currentDocId);
+    }
+    return true;
+}
+
 /**
  * Ensure a message has the revert UI wired up and tagged with the checkpoint id.
  * @param {HTMLElement} messageEl
@@ -4493,6 +4556,8 @@ function associateCheckpointWithMessage(messageEl, messageId, options = {}) {
     if (state.pendingUserMessage === messageEl || (state.pendingUserMessage && !state.pendingUserMessage.isConnected)) {
         state.pendingUserMessage = null;
     }
+
+    syncMessageIdentityInDocState(messageEl, { persist: !skipPersist });
 
     if (!skipPersist) {
         persistCurrentThreadState();
@@ -4648,6 +4713,48 @@ function handleResumeFromOperation(checkpointId) {
     addLog('info', 'Resuming from operation...', { scope: 'global' });
 }
 
+function trimDocStateAfterOperationCheckpoint(checkpointId) {
+    if (!checkpointId || !currentDocId) {
+        return false;
+    }
+
+    const docState = getDocState(currentDocId, false);
+    if (!docState || !Array.isArray(docState.items)) {
+        return false;
+    }
+
+    for (let itemIndex = 0; itemIndex < docState.items.length; itemIndex += 1) {
+        const item = docState.items[itemIndex];
+        if (!item || item.type !== 'run' || !Array.isArray(item.entries)) {
+            continue;
+        }
+
+        const entryIndex = item.entries.findIndex((entry) => getOperationCheckpointId(entry) === checkpointId);
+        if (entryIndex < 0) {
+            continue;
+        }
+
+        const retainedRun = {
+            ...item,
+            entries: item.entries.slice(0, entryIndex + 1),
+            status: item.status === 'in-progress' ? 'success' : item.status
+        };
+        docState.items = [
+            ...docState.items.slice(0, itemIndex),
+            retainedRun
+        ];
+        docState.activeRunId = null;
+        docState.lastStatus = 'idle';
+        docState.lastUpdated = Date.now();
+        persistDocState(currentDocId);
+        renderActiveDoc();
+        persistCurrentThreadState();
+        return true;
+    }
+
+    return false;
+}
+
 function handleOperationResumeApplied(message = {}) {
     const checkpointId = message.checkpoint_id || message.operation_checkpoint_id;
     if (!checkpointId || !elements.chatMessages) {
@@ -4657,6 +4764,12 @@ function handleOperationResumeApplied(message = {}) {
     const anchorEntry = elements.chatMessages.querySelector(`.run-entry[data-operation-checkpoint-id="${checkpointId}"]`);
     if (!anchorEntry) {
         console.warn('Operation resume applied but run entry was not found:', checkpointId);
+        if (trimDocStateAfterOperationCheckpoint(checkpointId)) {
+            return;
+        }
+        if (message.conversation_length !== undefined && message.conversation_length !== null) {
+            applyConversationRevert({ conversationLength: message.conversation_length });
+        }
         return;
     }
 
@@ -4762,7 +4875,8 @@ function applyConversationRevert(options = {}) {
         return null;
     };
 
-    const targetLength = parseLength(conversationLength);
+    const fallbackLength = parseLength(conversationLength);
+    const targetLength = messageId ? null : fallbackLength;
     let anchorMessage = null;
 
     if (targetLength !== null) {
@@ -4810,13 +4924,21 @@ function applyConversationRevert(options = {}) {
 
         if (!anchorMessage && messageId) {
             console.warn('Revert applied but anchor message not found:', messageId);
+            if (fallbackLength !== null) {
+                applyConversationRevert({ includeMessage, conversationLength: fallbackLength });
+                return;
+            }
         }
 
         if (!anchorMessage) {
-            anchorMessage = Array.from(container.querySelectorAll('.message')).pop() || null;
+            anchorMessage = messageId
+                ? null
+                : Array.from(container.querySelectorAll('.message')).pop() || null;
             if (!anchorMessage) {
                 // Nothing to trim; ensure non-message elements beyond this point are cleared.
-                Array.from(container.children).forEach(removeElement);
+                if (!messageId) {
+                    Array.from(container.children).forEach(removeElement);
+                }
             }
         }
 
@@ -4870,6 +4992,9 @@ function handleRevertApplied(message = {}) {
     const includeMessage = message.include_message !== false;
     const conversationLength = message.conversation_length;
     applyConversationRevert({ messageId, includeMessage, conversationLength });
+    if (message.timeline_reverted === false) {
+        showToast('Chat history reverted; model unchanged');
+    }
 }
 
 // ============================================
