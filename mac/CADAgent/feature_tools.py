@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import adsk.core
 import adsk.fusion
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _VALID_DIAMETER_UNITS = {"mm", "cm", "m", "in"}
 _VALID_THICKNESS_UNITS = {"mm", "cm", "m", "in"}
+_VALID_ANGLE_UNITS = {"deg", "rad"}
 _MM_PER_UNIT = {
     "mm": 1.0,
     "cm": 10.0,
@@ -60,7 +61,11 @@ def _point_to_mm_dict(point_cm: adsk.core.Point3D) -> Dict[str, float]:
 
 def _is_missing_target_body_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "no target body found to cut or intersect" in message
+    return (
+        "no target body found to cut or intersect" in message
+        or "no_target_body" in message
+        or "no target body" in message
+    )
 
 
 def _is_logical_selection_error(exc: Exception) -> bool:
@@ -475,6 +480,7 @@ def _serialize_feature_from_timeline_item(
         "timeline_name": getattr(timeline_item, "name", ""),
         "entity_token": normalized_token,
         "is_suppressed": getattr(feature, "isSuppressed", None),
+        "suppression_supported": hasattr(feature, "isSuppressed"),
     }
 
     parent_component = getattr(feature, "parentComponent", None)
@@ -533,7 +539,7 @@ def _serialize_editable_feature_parameters(feature: adsk.fusion.Feature, feature
         distance_param = _get_extrude_distance_parameter(extrude) if extrude else None
         if distance_param is not None:
             supported.append("distance")
-            parameters["distance"] = _parameter_snapshot(distance_param)
+            parameters["distance"] = _parameter_snapshot(distance_param, kind="length")
 
     elif feature_type == "HoleFeature":
         try:
@@ -545,12 +551,64 @@ def _serialize_editable_feature_parameters(feature: adsk.fusion.Feature, feature
             depth_param = _get_hole_depth_parameter(hole)
             if diameter_param is not None:
                 supported.append("diameter")
-                parameters["diameter"] = _parameter_snapshot(diameter_param)
+                parameters["diameter"] = _parameter_snapshot(diameter_param, kind="length")
             if depth_param is not None:
                 supported.append("depth")
-                parameters["depth"] = _parameter_snapshot(depth_param)
+                parameters["depth"] = _parameter_snapshot(depth_param, kind="length")
+
+    elif feature_type == "FilletFeature":
+        try:
+            fillet = adsk.fusion.FilletFeature.cast(feature)
+        except Exception:
+            fillet = None
+        radius_param = _get_fillet_radius_parameter(fillet) if fillet else None
+        if radius_param is not None:
+            supported.append("radius")
+            parameters["radius"] = _parameter_snapshot(radius_param, kind="length")
+
+    elif feature_type == "ChamferFeature":
+        try:
+            chamfer = adsk.fusion.ChamferFeature.cast(feature)
+        except Exception:
+            chamfer = None
+        distance_param = _get_chamfer_distance_parameter(chamfer) if chamfer else None
+        if distance_param is not None:
+            supported.append("chamfer_distance")
+            parameters["chamfer_distance"] = _parameter_snapshot(distance_param, kind="length")
+
+    elif feature_type == "ShellFeature":
+        try:
+            shell = adsk.fusion.ShellFeature.cast(feature)
+        except Exception:
+            shell = None
+        for name, parameter in _get_shell_thickness_parameters(shell).items():
+            supported.append(name)
+            parameters[name] = _parameter_snapshot(parameter, kind="length")
+
+    elif feature_type == "RectangularPatternFeature":
+        try:
+            pattern = adsk.fusion.RectangularPatternFeature.cast(feature)
+        except Exception:
+            pattern = None
+        for name, parameter in _get_rectangular_pattern_parameters(pattern).items():
+            supported.append(name)
+            snapshot_kind = "count" if "count" in name else "length"
+            parameters[name] = _parameter_snapshot(parameter, kind=snapshot_kind)
+
+    elif feature_type == "CircularPatternFeature":
+        try:
+            pattern = adsk.fusion.CircularPatternFeature.cast(feature)
+        except Exception:
+            pattern = None
+        for name, parameter in _get_circular_pattern_parameters(pattern).items():
+            supported.append(name)
+            snapshot_kind = "count" if name == "circular_count" else "angle"
+            parameters[name] = _parameter_snapshot(parameter, kind=snapshot_kind)
 
     else:
+        return None
+
+    if len(supported) == 1:
         return None
 
     return {
@@ -567,7 +625,7 @@ def _serialize_editable_feature_parameters(feature: adsk.fusion.Feature, feature
     }
 
 
-def _parameter_snapshot(parameter: Any) -> Dict[str, Any]:
+def _parameter_snapshot(parameter: Any, kind: str = "length") -> Dict[str, Any]:
     snapshot: Dict[str, Any] = {}
     try:
         expression = getattr(parameter, "expression", None)
@@ -576,12 +634,146 @@ def _parameter_snapshot(parameter: Any) -> Dict[str, Any]:
     except Exception:
         pass
     try:
-        value_cm = float(getattr(parameter, "value", None))
-        snapshot["value_cm"] = _safe_round(value_cm, 6)
-        snapshot["value_mm"] = _safe_round(value_cm * 10.0, 6)
+        raw_value = float(getattr(parameter, "value", None))
+        if kind == "length":
+            snapshot["value_cm"] = _safe_round(raw_value, 6)
+            snapshot["value_mm"] = _safe_round(raw_value * 10.0, 6)
+        elif kind == "angle":
+            snapshot["value_rad"] = _safe_round(raw_value, 6)
+            snapshot["value_deg"] = _safe_round(math.degrees(raw_value), 6)
+        else:
+            rounded = round(raw_value)
+            snapshot["value"] = int(rounded) if abs(raw_value - rounded) <= 1e-6 else _safe_round(raw_value, 6)
     except Exception:
         pass
     return snapshot
+
+
+def _parameter_is_editable(parameter: Any) -> bool:
+    return parameter is not None and (
+        hasattr(parameter, "expression") or hasattr(parameter, "value")
+    )
+
+
+def _collection_count(collection: Any) -> int:
+    if collection is None:
+        return 0
+    try:
+        return int(getattr(collection, "count"))
+    except Exception:
+        try:
+            return len(collection)
+        except Exception:
+            return 0
+
+
+def _collection_item(collection: Any, index: int) -> Any:
+    if collection is None:
+        return None
+    try:
+        return collection.item(index)
+    except Exception:
+        try:
+            return collection[index]
+        except Exception:
+            return None
+
+
+def _get_fillet_radius_parameter(fillet: Any) -> Any:
+    if not fillet:
+        return None
+    edge_sets = getattr(fillet, "edgeSets", None)
+    if _collection_count(edge_sets) != 1:
+        return None
+    edge_set = _collection_item(edge_sets, 0)
+    try:
+        constant_edge_set = adsk.fusion.ConstantRadiusFilletEdgeSet.cast(edge_set)
+    except Exception:
+        constant_edge_set = None
+    parameter = getattr(constant_edge_set, "radius", None) if constant_edge_set else None
+    return parameter if _parameter_is_editable(parameter) else None
+
+
+def _get_chamfer_distance_parameter(chamfer: Any) -> Any:
+    if not chamfer:
+        return None
+
+    edge_sets = getattr(chamfer, "edgeSets", None)
+    if _collection_count(edge_sets) == 1:
+        edge_set = _collection_item(edge_sets, 0)
+        try:
+            equal_edge_set = adsk.fusion.EqualDistanceChamferEdgeSet.cast(edge_set)
+        except Exception:
+            equal_edge_set = None
+        parameter = getattr(equal_edge_set, "distance", None) if equal_edge_set else None
+        if _parameter_is_editable(parameter):
+            return parameter
+
+    try:
+        type_definition = getattr(chamfer, "chamferTypeDefinition", None)
+    except Exception:
+        type_definition = None
+    try:
+        equal_type_definition = adsk.fusion.EqualDistanceChamferTypeDefinition.cast(type_definition)
+    except Exception:
+        equal_type_definition = None
+    parameter = getattr(equal_type_definition, "distance", None) if equal_type_definition else None
+    return parameter if _parameter_is_editable(parameter) else None
+
+
+def _get_shell_thickness_parameters(shell: Any) -> Dict[str, Any]:
+    if not shell:
+        return {}
+    parameters: Dict[str, Any] = {}
+    inside = getattr(shell, "insideThickness", None)
+    outside = getattr(shell, "outsideThickness", None)
+    if _parameter_is_editable(inside):
+        parameters["inside_thickness"] = inside
+    if _parameter_is_editable(outside):
+        parameters["outside_thickness"] = outside
+    return parameters
+
+
+def _get_rectangular_pattern_parameters(pattern: Any) -> Dict[str, Any]:
+    if not pattern:
+        return {}
+
+    parameters: Dict[str, Any] = {}
+    quantity_one = getattr(pattern, "quantityOne", None)
+    quantity_two = getattr(pattern, "quantityTwo", None)
+    if _parameter_is_editable(quantity_one):
+        parameters["rectangular_count_one"] = quantity_one
+    if _parameter_is_editable(quantity_two):
+        parameters["rectangular_count_two"] = quantity_two
+
+    try:
+        distance_type = getattr(pattern, "patternDistanceType", None)
+    except Exception:
+        distance_type = None
+    spacing_type = getattr(adsk.fusion.PatternDistanceType, "SpacingPatternDistanceType", None)
+    if distance_type != spacing_type:
+        return parameters
+
+    distance_one = getattr(pattern, "distanceOne", None)
+    distance_two = getattr(pattern, "distanceTwo", None)
+    if _parameter_is_editable(distance_one):
+        parameters["rectangular_spacing_one"] = distance_one
+    if _parameter_is_editable(distance_two):
+        parameters["rectangular_spacing_two"] = distance_two
+    return parameters
+
+
+def _get_circular_pattern_parameters(pattern: Any) -> Dict[str, Any]:
+    if not pattern:
+        return {}
+    parameters: Dict[str, Any] = {}
+    quantity = getattr(pattern, "quantity", None)
+    total_angle = getattr(pattern, "totalAngle", None)
+    if _parameter_is_editable(quantity):
+        parameters["circular_count"] = quantity
+    if _parameter_is_editable(total_angle):
+        parameters["circular_total_angle"] = total_angle
+    return parameters
 
 
 def _get_extrude_distance_parameter(extrude: Any) -> Any:
@@ -674,6 +866,126 @@ def _set_length_parameter(parameter: Any, value: float, unit: str, label: str) -
     raise FeatureOperationError(f"Feature does not expose an editable {label} parameter.")
 
 
+def _unit_to_radians(value: float, unit: str) -> float:
+    unit_norm = (unit or "deg").strip().lower()
+    if unit_norm == "deg":
+        return math.radians(float(value))
+    if unit_norm == "rad":
+        return float(value)
+    raise FeatureOperationError(f"Unsupported angle unit '{unit}'.")
+
+
+def _set_angle_parameter(parameter: Any, value: float, unit: str, label: str) -> str:
+    expression = f"{float(value):g} {unit or 'deg'}"
+    try:
+        if hasattr(parameter, "expression"):
+            parameter.expression = expression
+            return expression
+    except Exception as exc:
+        logger.debug("Failed to set %s expression: %s", label, exc)
+
+    try:
+        if hasattr(parameter, "value"):
+            parameter.value = _unit_to_radians(float(value), unit or "deg")
+            return expression
+    except Exception as exc:
+        raise FeatureOperationError(f"Unable to set {label}: {exc}") from exc
+
+    raise FeatureOperationError(f"Feature does not expose an editable {label} parameter.")
+
+
+def _set_count_parameter(parameter: Any, value: int, label: str) -> int:
+    expression = str(int(value))
+    try:
+        if hasattr(parameter, "expression"):
+            parameter.expression = expression
+            return int(value)
+    except Exception as exc:
+        logger.debug("Failed to set %s expression: %s", label, exc)
+
+    try:
+        if hasattr(parameter, "value"):
+            parameter.value = float(int(value))
+            return int(value)
+    except Exception as exc:
+        raise FeatureOperationError(f"Unable to set {label}: {exc}") from exc
+
+    raise FeatureOperationError(f"Feature does not expose an editable {label} parameter.")
+
+
+def _capture_parameter_state(parameter: Any) -> Dict[str, Any]:
+    state: Dict[str, Any] = {}
+    try:
+        if hasattr(parameter, "expression"):
+            state["expression"] = str(parameter.expression)
+    except Exception:
+        pass
+    try:
+        if hasattr(parameter, "value"):
+            state["value"] = float(parameter.value)
+    except Exception:
+        pass
+    return state
+
+
+def _restore_parameter_state(parameter: Any, state: Mapping[str, Any], label: str) -> None:
+    if "expression" in state:
+        try:
+            parameter.expression = str(state["expression"])
+            return
+        except Exception as exc:
+            logger.debug("Failed to restore %s expression: %s", label, exc)
+
+    if "value" in state:
+        try:
+            parameter.value = float(state["value"])
+            return
+        except Exception as exc:
+            raise FeatureOperationError(f"Unable to restore {label}: {exc}") from exc
+
+    raise FeatureOperationError(f"No rollback state was captured for {label}.")
+
+
+def _rollback_adjust_feature_changes(
+    design: adsk.fusion.Design,
+    feature: adsk.fusion.Feature,
+    timeline_object: Any,
+    original_feature_name: str,
+    original_timeline_name: str,
+    parameter_states: Sequence[Tuple[Any, Mapping[str, Any], str]],
+) -> None:
+    rollback_errors: List[str] = []
+
+    for parameter, state, label in reversed(list(parameter_states)):
+        try:
+            _restore_parameter_state(parameter, state, label)
+        except Exception as exc:
+            rollback_errors.append(str(exc))
+
+    try:
+        feature.name = original_feature_name
+    except Exception:
+        pass
+    if timeline_object:
+        try:
+            timeline_object.name = original_timeline_name
+        except Exception:
+            pass
+
+    try:
+        rollback_result = design.computeAll()
+        if rollback_result is False:
+            raise RuntimeError("rollback recompute did not complete")
+    except Exception as exc:
+        rollback_errors.append(str(exc))
+
+    if rollback_errors:
+        raise FeatureOperationError(
+            "Feature parameter edit failed and rollback failed; design may be changed: "
+            + "; ".join(rollback_errors)
+        )
+
+
 def _resolve_single_feature_by_token(design: adsk.fusion.Design, feature_token: str) -> adsk.fusion.Feature:
     entities = design.findEntityByToken(feature_token)
     if not entities:
@@ -691,21 +1003,27 @@ def _resolve_single_feature_by_token(design: adsk.fusion.Design, feature_token: 
     return feature
 
 
-def adjust_feature_parameters(
+def _active_parametric_design(
     app: adsk.core.Application,
-    feature_token: str,
-    parameters: Dict[str, Any],
+    operation_label: str,
+    design: Optional[adsk.fusion.Design] = None,
+) -> adsk.fusion.Design:
+    if design is None:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        raise FeatureOperationError("No active Fusion design found.")
+    if not getattr(design, "isValid", True):
+        raise FeatureOperationError("Fusion design context is no longer valid.")
+    if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+        raise FeatureOperationError(f"{operation_label} requires Parametric design mode.")
+    return design
+
+
+def _validate_feature_identity(
+    feature: adsk.fusion.Feature,
     expected_name: str = "",
     expected_timeline_index: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Safely adjust a narrow set of editable feature parameters."""
-    design = adsk.fusion.Design.cast(app.activeProduct)
-    if not design:
-        raise FeatureOperationError("No active Fusion design found.")
-    if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
-        raise FeatureOperationError("Feature parameter edits require Parametric design mode.")
-
-    feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
     feature_type = _normalize_object_type(getattr(feature, "objectType", None))
     timeline_object = getattr(feature, "timelineObject", None)
     timeline_index = getattr(timeline_object, "index", None) if timeline_object else None
@@ -729,73 +1047,442 @@ def adjust_feature_parameters(
                 f"Safety check failed: expected timeline index {expected_index_int} but found {timeline_index}."
             )
 
+    return {
+        "feature_type": feature_type,
+        "timeline_object": timeline_object,
+        "timeline_index": timeline_index,
+        "timeline_name": timeline_name,
+        "feature_name": feature_name,
+    }
+
+
+def set_feature_suppression(
+    app: adsk.core.Application,
+    feature_token: str,
+    suppress: bool,
+    expected_name: str = "",
+    expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
+) -> Dict[str, Any]:
+    """Safely suppress or unsuppress one timeline feature."""
+    design = _active_parametric_design(app, "Feature suppression changes", design)
+    feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
+    identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
+
+    if not hasattr(feature, "isSuppressed"):
+        raise FeatureOperationError(
+            f"{identity['feature_type']} does not expose an editable suppression state."
+        )
+
+    try:
+        current_suppressed = bool(getattr(feature, "isSuppressed", False))
+    except Exception as exc:
+        raise FeatureOperationError(f"Unable to read feature suppression state: {exc}") from exc
+
+    target_suppressed = bool(suppress)
+    no_op = current_suppressed == target_suppressed
+
+    if not no_op:
+        try:
+            setattr(feature, "isSuppressed", target_suppressed)
+            compute_result = design.computeAll()
+            if compute_result is False:
+                raise RuntimeError("recompute did not complete")
+        except Exception as exc:
+            try:
+                setattr(feature, "isSuppressed", current_suppressed)
+                rollback_result = design.computeAll()
+                if rollback_result is False:
+                    raise RuntimeError("rollback recompute did not complete")
+                rolled_back_suppressed = bool(getattr(feature, "isSuppressed"))
+                if rolled_back_suppressed != current_suppressed:
+                    raise RuntimeError(
+                        f"rollback left suppression state {rolled_back_suppressed}; expected {current_suppressed}"
+                    )
+            except Exception as rollback_exc:
+                raise FeatureOperationError(
+                    f"Feature suppression recompute failed and rollback failed; design may be changed: {rollback_exc}"
+                ) from exc
+            raise FeatureOperationError(
+                f"Feature suppression recompute failed; reverted suppression state: {exc}"
+            ) from exc
+
+    if no_op:
+        is_suppressed = current_suppressed
+    else:
+        try:
+            is_suppressed = bool(getattr(feature, "isSuppressed"))
+        except Exception as exc:
+            raise FeatureOperationError(
+                f"Unable to verify feature suppression state after recompute: {exc}"
+            ) from exc
+
+    if is_suppressed != target_suppressed:
+        raise FeatureOperationError("Feature suppression state did not match the requested state after recompute.")
+
+    if no_op:
+        action = "Already suppressed" if target_suppressed else "Already unsuppressed"
+    else:
+        action = "Suppressed" if target_suppressed else "Unsuppressed"
+    feature_name = identity["feature_name"] or identity["timeline_name"]
+
+    return {
+        "success": True,
+        "message": f"{action} {identity['feature_type']}: {feature_name or 'feature'}",
+        "feature_type": identity["feature_type"],
+        "feature_name": feature_name,
+        "timeline_index": identity["timeline_index"],
+        "is_suppressed": is_suppressed,
+        "no_op": no_op,
+    }
+
+
+def delete_feature(
+    app: adsk.core.Application,
+    feature_token: str,
+    expected_name: str = "",
+    expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
+) -> Dict[str, Any]:
+    """Safely delete one timeline feature by token."""
+    design = _active_parametric_design(app, "Feature deletion", design)
+    feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
+    identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
+
+    feature_type = identity["feature_type"]
+    timeline_object = identity["timeline_object"]
+    deleted_feature_name = identity["feature_name"] or identity["timeline_name"] or "feature"
+    deleted_timeline_index = identity["timeline_index"]
+
+    delete_callable = getattr(feature, "deleteMe", None)
+    delete_target_label = feature_type
+    if not callable(delete_callable) and timeline_object is not None:
+        delete_callable = getattr(timeline_object, "deleteMe", None)
+        delete_target_label = "timeline object"
+    if not callable(delete_callable):
+        raise FeatureOperationError(f"{feature_type} does not expose a deletion API.")
+
+    try:
+        delete_result = delete_callable()
+    except Exception as exc:
+        raise FeatureOperationError(f"Failed to delete {feature_type}: {exc}") from exc
+    if delete_result is False:
+        raise FeatureOperationError(
+            f"Fusion reported failure deleting {delete_target_label} for {deleted_feature_name}."
+        )
+
+    try:
+        compute_result = design.computeAll()
+    except Exception as exc:
+        raise FeatureOperationError(
+            f"Deleted {feature_type} but recompute failed; design may already be changed: {exc}"
+        ) from exc
+    if compute_result is False:
+        raise FeatureOperationError(
+            f"Deleted {feature_type} but recompute did not complete; design may already be changed."
+        )
+
+    return {
+        "success": True,
+        "message": f"Deleted {feature_type}: {deleted_feature_name}",
+        "feature_type": feature_type,
+        "feature_name": deleted_feature_name,
+        "timeline_index": deleted_timeline_index,
+        "deleted_feature_name": deleted_feature_name,
+        "deleted_timeline_index": deleted_timeline_index,
+        "recomputed": True,
+    }
+
+
+def adjust_feature_parameters(
+    app: adsk.core.Application,
+    feature_token: str,
+    parameters: Dict[str, Any],
+    expected_name: str = "",
+    expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
+) -> Dict[str, Any]:
+    """Safely adjust a narrow set of editable feature parameters."""
+    design = _active_parametric_design(app, "Feature parameter edits", design)
+    feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
+    identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
+    feature_type = identity["feature_type"]
+    timeline_object = identity["timeline_object"]
+    timeline_index = identity["timeline_index"]
+    timeline_name = identity["timeline_name"]
+    feature_name = identity["feature_name"]
+
     if not isinstance(parameters, dict) or not parameters:
         raise FeatureOperationError("No feature parameters were provided to edit.")
 
     changed: Dict[str, Any] = {}
-
-    if "name" in parameters:
-        new_name = str(parameters.get("name") or "").strip()
-        if not new_name:
-            raise FeatureOperationError("Feature name must be non-empty.")
-        try:
-            feature.name = new_name
-        except Exception:
-            pass
-        if timeline_object:
-            try:
-                timeline_object.name = new_name
-            except Exception:
-                pass
-        changed["name"] = new_name
-        feature_name = new_name
-
-    if "distance" in parameters:
-        if feature_type != "ExtrudeFeature":
-            raise FeatureOperationError("distance edits are supported only for ExtrudeFeature.")
-        try:
-            extrude = adsk.fusion.ExtrudeFeature.cast(feature)
-        except Exception:
-            extrude = None
-        parameter = _get_extrude_distance_parameter(extrude)
-        if parameter is None:
-            raise FeatureOperationError("This ExtrudeFeature does not expose an editable distance parameter.")
-        unit = str(parameters.get("distance_unit") or "mm").strip().lower()
-        changed["distance"] = _set_length_parameter(parameter, float(parameters["distance"]), unit, "extrude distance")
-
-    if "diameter" in parameters or "depth" in parameters:
-        if feature_type != "HoleFeature":
-            raise FeatureOperationError("diameter/depth edits are supported only for HoleFeature.")
-        try:
-            hole = adsk.fusion.HoleFeature.cast(feature)
-        except Exception:
-            hole = None
-        if hole is None:
-            raise FeatureOperationError("Unable to access HoleFeature APIs for this feature.")
-
-        if "diameter" in parameters:
-            parameter = _get_hole_diameter_parameter(hole)
-            if parameter is None:
-                raise FeatureOperationError("This HoleFeature does not expose an editable diameter parameter.")
-            unit = str(parameters.get("diameter_unit") or "mm").strip().lower()
-            changed["diameter"] = _set_length_parameter(parameter, float(parameters["diameter"]), unit, "hole diameter")
-
-        if "depth" in parameters:
-            parameter = _get_hole_depth_parameter(hole)
-            if parameter is None:
-                raise FeatureOperationError(
-                    "This HoleFeature does not expose an editable depth parameter; through-all holes cannot be depth-edited."
-                )
-            unit = str(parameters.get("depth_unit") or "mm").strip().lower()
-            changed["depth"] = _set_length_parameter(parameter, float(parameters["depth"]), unit, "hole depth")
-
-    if not changed:
-        raise FeatureOperationError("No supported feature parameters were changed.")
+    original_feature_name = feature_name
+    original_timeline_name = timeline_name
+    parameter_states: List[Tuple[Any, Mapping[str, Any], str]] = []
 
     try:
-        design.computeAll()
+        if "name" in parameters:
+            new_name = str(parameters.get("name") or "").strip()
+            if not new_name:
+                raise FeatureOperationError("Feature name must be non-empty.")
+            try:
+                feature.name = new_name
+            except Exception:
+                pass
+            if timeline_object:
+                try:
+                    timeline_object.name = new_name
+                except Exception:
+                    pass
+            changed["name"] = new_name
+            feature_name = new_name
+
+        if "distance" in parameters:
+            if feature_type != "ExtrudeFeature":
+                raise FeatureOperationError("distance edits are supported only for ExtrudeFeature.")
+            try:
+                extrude = adsk.fusion.ExtrudeFeature.cast(feature)
+            except Exception:
+                extrude = None
+            parameter = _get_extrude_distance_parameter(extrude)
+            if parameter is None:
+                raise FeatureOperationError("This ExtrudeFeature does not expose an editable distance parameter.")
+            unit = str(parameters.get("distance_unit") or "mm").strip().lower()
+            parameter_states.append((parameter, _capture_parameter_state(parameter), "extrude distance"))
+            changed["distance"] = _set_length_parameter(parameter, float(parameters["distance"]), unit, "extrude distance")
+
+        if "diameter" in parameters or "depth" in parameters:
+            if feature_type != "HoleFeature":
+                raise FeatureOperationError("diameter/depth edits are supported only for HoleFeature.")
+            try:
+                hole = adsk.fusion.HoleFeature.cast(feature)
+            except Exception:
+                hole = None
+            if hole is None:
+                raise FeatureOperationError("Unable to access HoleFeature APIs for this feature.")
+
+            if "diameter" in parameters:
+                parameter = _get_hole_diameter_parameter(hole)
+                if parameter is None:
+                    raise FeatureOperationError("This HoleFeature does not expose an editable diameter parameter.")
+                unit = str(parameters.get("diameter_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "hole diameter"))
+                changed["diameter"] = _set_length_parameter(parameter, float(parameters["diameter"]), unit, "hole diameter")
+
+            if "depth" in parameters:
+                parameter = _get_hole_depth_parameter(hole)
+                if parameter is None:
+                    raise FeatureOperationError(
+                        "This HoleFeature does not expose an editable depth parameter; through-all holes cannot be depth-edited."
+                    )
+                unit = str(parameters.get("depth_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "hole depth"))
+                changed["depth"] = _set_length_parameter(parameter, float(parameters["depth"]), unit, "hole depth")
+
+        if "radius" in parameters:
+            if feature_type != "FilletFeature":
+                raise FeatureOperationError("radius edits are supported only for FilletFeature.")
+            try:
+                fillet = adsk.fusion.FilletFeature.cast(feature)
+            except Exception:
+                fillet = None
+            parameter = _get_fillet_radius_parameter(fillet)
+            if parameter is None:
+                raise FeatureOperationError(
+                    "This FilletFeature does not expose one editable constant-radius parameter."
+                )
+            unit = str(parameters.get("radius_unit") or "mm").strip().lower()
+            parameter_states.append((parameter, _capture_parameter_state(parameter), "fillet radius"))
+            changed["radius"] = _set_length_parameter(parameter, float(parameters["radius"]), unit, "fillet radius")
+
+        if "chamfer_distance" in parameters:
+            if feature_type != "ChamferFeature":
+                raise FeatureOperationError("chamfer_distance edits are supported only for ChamferFeature.")
+            try:
+                chamfer = adsk.fusion.ChamferFeature.cast(feature)
+            except Exception:
+                chamfer = None
+            parameter = _get_chamfer_distance_parameter(chamfer)
+            if parameter is None:
+                raise FeatureOperationError(
+                    "This ChamferFeature does not expose one editable equal-distance chamfer parameter."
+                )
+            unit = str(parameters.get("chamfer_distance_unit") or "mm").strip().lower()
+            parameter_states.append((parameter, _capture_parameter_state(parameter), "chamfer distance"))
+            changed["chamfer_distance"] = _set_length_parameter(
+                parameter,
+                float(parameters["chamfer_distance"]),
+                unit,
+                "chamfer distance",
+            )
+
+        if "inside_thickness" in parameters or "outside_thickness" in parameters:
+            if feature_type != "ShellFeature":
+                raise FeatureOperationError("inside_thickness/outside_thickness edits are supported only for ShellFeature.")
+            try:
+                shell = adsk.fusion.ShellFeature.cast(feature)
+            except Exception:
+                shell = None
+            shell_parameters = _get_shell_thickness_parameters(shell)
+
+            if "inside_thickness" in parameters:
+                parameter = shell_parameters.get("inside_thickness")
+                if parameter is None:
+                    raise FeatureOperationError("This ShellFeature does not expose an editable inside_thickness parameter.")
+                unit = str(parameters.get("inside_thickness_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "shell inside thickness"))
+                changed["inside_thickness"] = _set_length_parameter(
+                    parameter,
+                    float(parameters["inside_thickness"]),
+                    unit,
+                    "shell inside thickness",
+                )
+
+            if "outside_thickness" in parameters:
+                parameter = shell_parameters.get("outside_thickness")
+                if parameter is None:
+                    raise FeatureOperationError("This ShellFeature does not expose an editable outside_thickness parameter.")
+                unit = str(parameters.get("outside_thickness_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "shell outside thickness"))
+                changed["outside_thickness"] = _set_length_parameter(
+                    parameter,
+                    float(parameters["outside_thickness"]),
+                    unit,
+                    "shell outside thickness",
+                )
+
+        if any(key in parameters for key in {"rectangular_count_one", "rectangular_count_two", "rectangular_spacing_one", "rectangular_spacing_two"}):
+            if feature_type != "RectangularPatternFeature":
+                raise FeatureOperationError(
+                    "rectangular_count_*/rectangular_spacing_* edits are supported only for RectangularPatternFeature."
+                )
+            try:
+                pattern = adsk.fusion.RectangularPatternFeature.cast(feature)
+            except Exception:
+                pattern = None
+            pattern_parameters = _get_rectangular_pattern_parameters(pattern)
+
+            if "rectangular_count_one" in parameters:
+                parameter = pattern_parameters.get("rectangular_count_one")
+                if parameter is None:
+                    raise FeatureOperationError("This RectangularPatternFeature does not expose an editable rectangular_count_one parameter.")
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "rectangular pattern count one"))
+                changed["rectangular_count_one"] = _set_count_parameter(
+                    parameter,
+                    int(parameters["rectangular_count_one"]),
+                    "rectangular pattern count one",
+                )
+
+            if "rectangular_spacing_one" in parameters:
+                parameter = pattern_parameters.get("rectangular_spacing_one")
+                if parameter is None:
+                    raise FeatureOperationError(
+                        "This RectangularPatternFeature does not expose an editable rectangular_spacing_one parameter."
+                    )
+                unit = str(parameters.get("rectangular_spacing_one_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "rectangular pattern spacing one"))
+                changed["rectangular_spacing_one"] = _set_length_parameter(
+                    parameter,
+                    float(parameters["rectangular_spacing_one"]),
+                    unit,
+                    "rectangular pattern spacing one",
+                )
+
+            if "rectangular_count_two" in parameters:
+                parameter = pattern_parameters.get("rectangular_count_two")
+                if parameter is None:
+                    raise FeatureOperationError("This RectangularPatternFeature does not expose an editable rectangular_count_two parameter.")
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "rectangular pattern count two"))
+                changed["rectangular_count_two"] = _set_count_parameter(
+                    parameter,
+                    int(parameters["rectangular_count_two"]),
+                    "rectangular pattern count two",
+                )
+
+            if "rectangular_spacing_two" in parameters:
+                parameter = pattern_parameters.get("rectangular_spacing_two")
+                if parameter is None:
+                    raise FeatureOperationError(
+                        "This RectangularPatternFeature does not expose an editable rectangular_spacing_two parameter."
+                    )
+                unit = str(parameters.get("rectangular_spacing_two_unit") or "mm").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "rectangular pattern spacing two"))
+                changed["rectangular_spacing_two"] = _set_length_parameter(
+                    parameter,
+                    float(parameters["rectangular_spacing_two"]),
+                    unit,
+                    "rectangular pattern spacing two",
+                )
+
+        if "circular_count" in parameters or "circular_total_angle" in parameters:
+            if feature_type != "CircularPatternFeature":
+                raise FeatureOperationError("circular_count/circular_total_angle edits are supported only for CircularPatternFeature.")
+            try:
+                pattern = adsk.fusion.CircularPatternFeature.cast(feature)
+            except Exception:
+                pattern = None
+            pattern_parameters = _get_circular_pattern_parameters(pattern)
+
+            if "circular_count" in parameters:
+                parameter = pattern_parameters.get("circular_count")
+                if parameter is None:
+                    raise FeatureOperationError("This CircularPatternFeature does not expose an editable circular_count parameter.")
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "circular pattern count"))
+                changed["circular_count"] = _set_count_parameter(
+                    parameter,
+                    int(parameters["circular_count"]),
+                    "circular pattern count",
+                )
+
+            if "circular_total_angle" in parameters:
+                parameter = pattern_parameters.get("circular_total_angle")
+                if parameter is None:
+                    raise FeatureOperationError(
+                        "This CircularPatternFeature does not expose an editable circular_total_angle parameter."
+                    )
+                unit = str(parameters.get("circular_total_angle_unit") or "deg").strip().lower()
+                parameter_states.append((parameter, _capture_parameter_state(parameter), "circular pattern total angle"))
+                changed["circular_total_angle"] = _set_angle_parameter(
+                    parameter,
+                    float(parameters["circular_total_angle"]),
+                    unit,
+                    "circular pattern total angle",
+                )
+
+        if not changed:
+            raise FeatureOperationError("No supported feature parameters were changed.")
+
+        compute_result = design.computeAll()
     except Exception as exc:
-        raise FeatureOperationError(f"Feature parameters changed but recompute failed: {exc}") from exc
+        if changed:
+            try:
+                _rollback_adjust_feature_changes(
+                    design,
+                    feature,
+                    timeline_object,
+                    original_feature_name,
+                    original_timeline_name,
+                    parameter_states,
+                )
+            except FeatureOperationError as rollback_exc:
+                raise rollback_exc from exc
+            raise FeatureOperationError(f"Feature parameter edit failed; reverted changes: {exc}") from exc
+        if isinstance(exc, FeatureOperationError):
+            raise
+        raise FeatureOperationError(f"Feature parameter edit failed: {exc}") from exc
+    if compute_result is False:
+        try:
+            _rollback_adjust_feature_changes(
+                design,
+                feature,
+                timeline_object,
+                original_feature_name,
+                original_timeline_name,
+                parameter_states,
+            )
+        except FeatureOperationError as rollback_exc:
+            raise rollback_exc
+        raise FeatureOperationError("Feature parameter edit failed; reverted changes: recompute did not complete.")
 
     return {
         "success": True,
@@ -1888,9 +2575,15 @@ def create_simple_hole(
                     raise
 
             if not hole_feature:
-                if last_exception and _is_logical_selection_error(last_exception):
+                if last_exception and (
+                    _is_logical_selection_error(last_exception)
+                    or _is_missing_target_body_error(last_exception)
+                ):
                     logger.info(
-                        "Simple hole through_all falling back to sketch-cut due to logicalSelection failure."
+                        "Simple hole through_all falling back to sketch-cut due to %s failure.",
+                        "logicalSelection"
+                        if _is_logical_selection_error(last_exception)
+                        else "missing target body",
                     )
                     _, selected_direction, fallback_cut_distance_cm = _create_hole_cut_fallback(
                         face_component,
@@ -3024,4 +3717,8 @@ __all__ = [
     "create_tapped_hole",
     "create_external_thread",
     "create_pattern_feature",
+    "delete_feature",
+    "set_feature_suppression",
+    "adjust_feature_parameters",
+    "capture_feature_snapshot",
 ]
