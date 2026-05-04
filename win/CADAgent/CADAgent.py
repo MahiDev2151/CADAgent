@@ -481,6 +481,7 @@ class AgentController:
             "client_capabilities": {
                 "timeline_feature_delete": True,
                 "timeline_feature_suppression": True,
+                "timeline_feature_parameter_edit": True,
             },
         }
 
@@ -1608,12 +1609,38 @@ class AgentController:
                 raise feature_tools.FeatureOperationError("Feature operation type was not specified.")
 
             if operation == "adjust_feature_parameters":
+                target_design = self._resolve_verified_active_design_for_session(
+                    doc_id,
+                    session_info,
+                    "adjust_feature_parameters",
+                    message,
+                )
                 feature_token = message.get("feature_token") or params.get("feature_token")
-                edit_params = message.get("parameters") or params
+                nested_edit_params = params.get("parameters") if isinstance(params, dict) else None
+                if isinstance(nested_edit_params, dict):
+                    edit_params = dict(nested_edit_params)
+                else:
+                    edit_params = dict(params) if isinstance(params, dict) else {}
+                    for metadata_key in (
+                        "feature_token",
+                        "expected_name",
+                        "expected_timeline_index",
+                        "expected_index",
+                        "parameters",
+                        "doc_id",
+                        "target_doc_id",
+                        "session_id",
+                        "target_session_id",
+                    ):
+                        edit_params.pop(metadata_key, None)
                 expected_name = message.get("expected_name") or params.get("expected_name") or ""
                 expected_timeline_index = message.get("expected_timeline_index")
                 if expected_timeline_index is None:
+                    expected_timeline_index = message.get("expected_index")
+                if expected_timeline_index is None:
                     expected_timeline_index = params.get("expected_timeline_index")
+                if expected_timeline_index is None:
+                    expected_timeline_index = params.get("expected_index")
 
                 if not feature_token:
                     raise feature_tools.FeatureOperationError("adjust_feature_parameters requires feature_token.")
@@ -1626,6 +1653,7 @@ class AgentController:
                     dict(edit_params),
                     str(expected_name),
                     int(expected_timeline_index) if expected_timeline_index is not None else None,
+                    design=target_design,
                 )
                 success = True
                 message_text = result.get("message", "Feature parameters adjusted successfully.")
@@ -1640,6 +1668,12 @@ class AgentController:
                 self._palette_manager.send_log('success', message_text, doc_id=doc_id)
 
             elif operation in {"suppress_feature", "unsuppress_feature"}:
+                target_design = self._resolve_verified_active_design_for_session(
+                    doc_id,
+                    session_info,
+                    operation,
+                    message,
+                )
                 feature_token = message.get("feature_token") or params.get("feature_token")
                 expected_name = message.get("expected_name") or params.get("expected_name") or ""
                 expected_timeline_index = message.get("expected_timeline_index")
@@ -1655,6 +1689,7 @@ class AgentController:
                     operation == "suppress_feature",
                     str(expected_name),
                     int(expected_timeline_index) if expected_timeline_index is not None else None,
+                    design=target_design,
                 )
                 success = True
                 message_text = result.get("message", "Feature suppression state updated successfully.")
@@ -1670,6 +1705,12 @@ class AgentController:
                 self._palette_manager.send_log('success', message_text, doc_id=doc_id)
 
             elif operation == "delete_feature":
+                target_design = self._resolve_verified_active_design_for_session(
+                    doc_id,
+                    session_info,
+                    "delete_feature",
+                    message,
+                )
                 feature_token = message.get("feature_token") or params.get("feature_token")
                 expected_name = message.get("expected_name") or params.get("expected_name") or ""
                 expected_timeline_index = message.get("expected_timeline_index")
@@ -1684,6 +1725,7 @@ class AgentController:
                     str(feature_token),
                     str(expected_name),
                     int(expected_timeline_index) if expected_timeline_index is not None else None,
+                    design=target_design,
                 )
                 success = True
                 message_text = result.get("message", "Feature deleted successfully.")
@@ -3170,6 +3212,73 @@ class AgentController:
         if not doc_id:
             return None
         return self._sessions.get(doc_id)
+
+    def _resolve_verified_active_design_for_session(
+        self,
+        doc_id: str,
+        session_info: Dict[str, Any],
+        operation_label: str,
+        message: Dict[str, Any],
+    ) -> adsk.fusion.Design:
+        params = message.get("parameters") if isinstance(message.get("parameters"), dict) else {}
+        requested_doc_id = (
+            message.get("doc_id")
+            or message.get("target_doc_id")
+            or params.get("doc_id")
+            or params.get("target_doc_id")
+        )
+        if requested_doc_id and str(requested_doc_id) != str(doc_id):
+            raise feature_tools.FeatureOperationError(
+                f"{operation_label} refused: message targets doc_id {requested_doc_id}, "
+                f"but arrived on doc_id {doc_id}."
+            )
+
+        expected_session_id = session_info.get("session_id")
+        requested_session_id = (
+            message.get("session_id")
+            or message.get("target_session_id")
+            or params.get("session_id")
+            or params.get("target_session_id")
+        )
+        if requested_session_id and expected_session_id and str(requested_session_id) != str(expected_session_id):
+            raise feature_tools.FeatureOperationError(
+                f"{operation_label} refused: message targets session {requested_session_id}, "
+                f"but document {doc_id} is bound to session {expected_session_id}."
+            )
+
+        active_doc = self._app.activeDocument if self._app else None
+        if not active_doc:
+            raise feature_tools.FeatureOperationError(
+                f"{operation_label} refused: no active Fusion document is available."
+            )
+
+        active_doc_id, active_doc_name = self._doc_identity(active_doc)
+        if str(active_doc_id) != str(doc_id):
+            target_name = session_info.get("doc_name") or doc_id
+            raise feature_tools.FeatureOperationError(
+                f"{operation_label} refused: target document '{target_name}' ({doc_id}) is not active. "
+                f"Active document is '{active_doc_name}' ({active_doc_id}). Activate the target document and retry."
+            )
+
+        design = self._resolve_design_reference(active_doc)
+        if not design:
+            raise feature_tools.FeatureOperationError(
+                f"{operation_label} refused: unable to resolve the active Fusion design for document {doc_id}."
+            )
+
+        design_doc = getattr(design, "document", None)
+        if design_doc:
+            design_doc_id, _ = self._doc_identity(design_doc)
+            if str(design_doc_id) != str(doc_id):
+                raise feature_tools.FeatureOperationError(
+                    f"{operation_label} refused: resolved design belongs to doc_id {design_doc_id}, "
+                    f"not requested doc_id {doc_id}."
+                )
+
+        session_info["document"] = active_doc
+        session_info["design"] = design
+        self._design = design
+        return design
 
     def _get_ws_client_for_doc(self, doc_id: Optional[str]) -> Optional[FusionWebSocketClient]:
         # Ensure token is fresh before returning client

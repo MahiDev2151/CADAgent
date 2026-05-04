@@ -1003,10 +1003,17 @@ def _resolve_single_feature_by_token(design: adsk.fusion.Design, feature_token: 
     return feature
 
 
-def _active_parametric_design(app: adsk.core.Application, operation_label: str) -> adsk.fusion.Design:
-    design = adsk.fusion.Design.cast(app.activeProduct)
+def _active_parametric_design(
+    app: adsk.core.Application,
+    operation_label: str,
+    design: Optional[adsk.fusion.Design] = None,
+) -> adsk.fusion.Design:
+    if design is None:
+        design = adsk.fusion.Design.cast(app.activeProduct)
     if not design:
         raise FeatureOperationError("No active Fusion design found.")
+    if not getattr(design, "isValid", True):
+        raise FeatureOperationError("Fusion design context is no longer valid.")
     if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
         raise FeatureOperationError(f"{operation_label} requires Parametric design mode.")
     return design
@@ -1055,9 +1062,10 @@ def set_feature_suppression(
     suppress: bool,
     expected_name: str = "",
     expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
 ) -> Dict[str, Any]:
     """Safely suppress or unsuppress one timeline feature."""
-    design = _active_parametric_design(app, "Feature suppression changes")
+    design = _active_parametric_design(app, "Feature suppression changes", design)
     feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
     identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
 
@@ -1134,9 +1142,10 @@ def delete_feature(
     feature_token: str,
     expected_name: str = "",
     expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
 ) -> Dict[str, Any]:
     """Safely delete one timeline feature by token."""
-    design = _active_parametric_design(app, "Feature deletion")
+    design = _active_parametric_design(app, "Feature deletion", design)
     feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
     identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
 
@@ -1191,9 +1200,10 @@ def adjust_feature_parameters(
     parameters: Dict[str, Any],
     expected_name: str = "",
     expected_timeline_index: Optional[int] = None,
+    design: Optional[adsk.fusion.Design] = None,
 ) -> Dict[str, Any]:
     """Safely adjust a narrow set of editable feature parameters."""
-    design = _active_parametric_design(app, "Feature parameter edits")
+    design = _active_parametric_design(app, "Feature parameter edits", design)
     feature = _resolve_single_feature_by_token(design, str(feature_token or "").strip())
     identity = _validate_feature_identity(feature, expected_name, expected_timeline_index)
     feature_type = identity["feature_type"]
