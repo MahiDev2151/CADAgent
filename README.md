@@ -29,8 +29,3 @@ Restart Fusion 360. The add-in loads automatically.
 2. Go to **Tools** > **Add-Ins** > **CADAgent** > **Run**
 3. Type your request (e.g., "Create a 5cm cube")
 4. Click **Execute**
-
-## Links
-
-- [Website](https://cadagentpro.com)
-- [Issues](https://github.com/er-fo/CADAgent/issues)
